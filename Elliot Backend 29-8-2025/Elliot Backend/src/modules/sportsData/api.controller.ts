@@ -41,19 +41,36 @@ export const syncPlayersToDB = async () => {
 
 export const calculatePlayerScores = async (req: any, res: any) => {
   const { playerIDs, user, preferredBookmaker = 'draftkings' } = req.body;
+  const canon = (s: any) =>
+    String(s ?? '')
+      .trim()
+      .replace(/\s+/g, '_');
+  const expectedOddID = (statID: string, playerID: string) => `${statID}-${canon(playerID)}-game-yn-yes`;
+  const matchesPlayerStatFlexible = (odd: any, playerID: string, statCategories: string[]) => {
+    if (!odd?.oddID || !odd?.statID) return false;
+    if (!statCategories.includes(odd.statID)) return false;
+    if (odd.statID === 'touchdowns') {
+      return canon(odd.oddID) === canon(expectedOddID(odd.statID, playerID));
+    }
+    return String(odd.oddID).includes(playerID);
+  };
   try {
     const matchedUser = await Models.Users.findOne({ email: user.email });
     if (!matchedUser) return res.status(404).json({ error: 'User not found' });
+
     if (matchedUser.subscription_status === 'inactive' && !matchedUser.has_accessed_once) {
       await Models.Users.findOneAndUpdate({ email: user.email }, { $set: { has_accessed_once: true } });
     }
+
     if (!playerIDs || !Array.isArray(playerIDs) || playerIDs.length < 2) {
       return res.status(400).send({ success: false, message: 'At least 2 playerIDs are required' });
     }
+
     const oddsData = await OddsStorage.findOne().lean();
     if (!oddsData) {
       return res.status(404).send({ success: false, message: 'No odds data found in database' });
     }
+
     const events: any[] = oddsData.data || [];
     const statCategories = [
       'passing_yards',
@@ -68,6 +85,7 @@ export const calculatePlayerScores = async (req: any, res: any) => {
       WR_TE: ['receiving_yards', 'receiving_receptions', 'touchdowns'],
       RB: ['rushing_yards', 'receiving_receptions', 'receiving_yards', 'touchdowns'],
     };
+
     const normalizeOdds = (val: any): number | null => {
       if (val === undefined || val === null) return null;
       if (typeof val === 'number') return val;
@@ -78,109 +96,133 @@ export const calculatePlayerScores = async (req: any, res: any) => {
       }
       return null;
     };
+
     const pickBookmaker = (byBookmaker: any, statID: string, preferred: string) => {
       if (!byBookmaker || Object.keys(byBookmaker).length === 0) return null;
+
       if (statID === 'receiving_yards' || statID === 'rushing_yards') {
         const priority = [preferred, 'bovada', 'caesars', 'prophetexchange', 'betonline', 'hardrockbet', 'draftkings'];
         for (const book of priority) {
           if (byBookmaker[book]) {
-            const bookData = byBookmaker[book];
-            return {
-              bookName: book,
-              odds: bookData.odds,
-              overUnder: bookData.overUnder,
-              lastUpdatedAt: bookData.lastUpdatedAt,
-            };
+            const b = byBookmaker[book];
+            return { bookName: book, odds: b.odds, overUnder: b.overUnder, lastUpdatedAt: b.lastUpdatedAt };
           }
         }
       } else {
         const priority = [preferred, 'draftkings', 'espnbet', 'fanduel', 'betmgm'];
         for (const book of priority) {
           if (byBookmaker[book]) {
-            const bookData = byBookmaker[book];
-            return {
-              bookName: book,
-              odds: bookData.odds,
-              overUnder: bookData.overUnder,
-              lastUpdatedAt: bookData.lastUpdatedAt,
-            };
+            const b = byBookmaker[book];
+            return { bookName: book, odds: b.odds, overUnder: b.overUnder, lastUpdatedAt: b.lastUpdatedAt };
           }
         }
       }
       let latest: any = null;
-      Object.entries(byBookmaker).forEach(([bookName, bookData]: any) => {
-        const bookTime = new Date(bookData.lastUpdatedAt || 0).getTime();
-        if (!latest || bookTime > latest._time) {
+      for (const [bookName, bookData] of Object.entries<any>(byBookmaker)) {
+        const t = new Date(bookData.lastUpdatedAt || 0).getTime();
+        if (!latest || t > latest._t) {
           latest = {
             bookName,
             odds: bookData.odds,
             overUnder: bookData.overUnder,
             lastUpdatedAt: bookData.lastUpdatedAt,
-            _time: bookTime,
+            _t: t,
           };
         }
-      });
+      }
       if (latest) {
-        delete latest._time;
+        delete latest._t;
         return latest;
       }
       return null;
     };
+
     const convertOddsToScore = (odds: number | null): number => {
       if (odds === null) return 0;
-      let prob = 0;
-      if (odds < 0) prob = -odds / (-odds + 100);
-      else prob = 100 / (odds + 100);
+      const prob = odds < 0 ? -odds / (-odds + 100) : 100 / (odds + 100);
       return prob * 100;
     };
+
     const processPlayerStats = (playerID: string) => {
       const playerEvents = events.filter((event) => {
         if (!event || !event.odds) return false;
-        return Object.values(event.odds).some((odd: any) => odd?.oddID?.includes(playerID));
+        return Object.values(event.odds).some((odd: any) => matchesPlayerStatFlexible(odd, playerID, statCategories));
       });
       if (playerEvents.length === 0) return null;
-      playerEvents.sort((a, b) => {
-        const aTime = new Date(a?.status?.startsAt || 0).getTime();
-        const bTime = new Date(b?.status?.startsAt || 0).getTime();
-        return bTime - aTime;
-      });
+      playerEvents.sort(
+        (a, b) => new Date(b?.status?.startsAt || 0).getTime() - new Date(a?.status?.startsAt || 0).getTime()
+      );
       const latestEvent = playerEvents[0];
       if (!latestEvent) return null;
+      const allOddsForStat: Record<
+        string,
+        Array<{ bookName: string; odds: number | null; overUnder: number | null; lastUpdatedAt: string | null }>
+      > = {};
       const propsMap: Record<
         string,
         { odds: number | null; overUnder: number | null; name: string | null; _time: number }
       > = {};
+
       for (const oddKey of Object.keys(latestEvent.odds || {})) {
         const odd = latestEvent.odds[oddKey];
-        if (!odd) continue;
-        if (!odd.oddID || !odd.oddID.includes(playerID)) continue;
+        if (!matchesPlayerStatFlexible(odd, playerID, statCategories)) continue;
+
         const statID = odd.statID;
-        if (!statCategories.includes(statID)) continue;
-        if (propsMap[statID]) {
-          continue;
+        const byBookmaker = odd.byBookmaker || {};
+        for (const [bookName, bookData] of Object.entries<any>(byBookmaker)) {
+          if (!allOddsForStat[statID]) allOddsForStat[statID] = [];
+          allOddsForStat[statID].push({
+            bookName,
+            odds: normalizeOdds(bookData?.odds),
+            overUnder: normalizeOdds(bookData?.overUnder),
+            lastUpdatedAt: (bookData?.lastUpdatedAt as string) ?? null,
+          });
         }
-        const chosenBook = pickBookmaker(odd.byBookmaker, statID, preferredBookmaker);
-        if (!chosenBook) continue;
-        const normalizedOdds = normalizeOdds(chosenBook.odds);
-        const normalizedOverUnder = normalizeOdds(chosenBook.overUnder);
+        if (propsMap[statID]) continue;
+        const chosen = pickBookmaker(byBookmaker, statID, preferredBookmaker);
+        if (!chosen) continue;
+
         propsMap[statID] = {
-          odds: normalizedOdds,
-          overUnder: normalizedOverUnder,
-          name: chosenBook.bookName || null,
-          _time: new Date(chosenBook.lastUpdatedAt || latestEvent.status?.startsAt || 0).getTime(),
+          odds: normalizeOdds(chosen.odds),
+          overUnder: normalizeOdds(chosen.overUnder),
+          name: chosen.bookName || null,
+          _time: new Date(chosen.lastUpdatedAt || latestEvent.status?.startsAt || 0).getTime(),
         };
       }
-
+      try {
+        console.log(
+          `\n[Player ${playerID}] All available odds by statID (latestEvent startsAt: ${
+            latestEvent?.status?.startsAt || 'N/A'
+          })`
+        );
+        Object.entries(allOddsForStat).forEach(([statID, rows]) => {
+          const sorted = rows.slice().sort((a, b) => {
+            const ta = new Date(a.lastUpdatedAt || 0).getTime();
+            const tb = new Date(b.lastUpdatedAt || 0).getTime();
+            return tb - ta;
+          });
+          console.group(`statID: ${statID}`);
+          console.table(
+            sorted.map((r) => ({
+              book: r.bookName,
+              odds: r.odds,
+              overUnder: r.overUnder,
+              lastUpdatedAt: r.lastUpdatedAt,
+            }))
+          );
+          console.groupEnd();
+        });
+      } catch (e) {
+        console.warn('Logging all odds failed:', e);
+      }
       const foundPositions: Set<string> = new Set();
       Object.values(latestEvent.odds || {}).forEach((odd: any) => {
-        if (!odd?.oddID?.includes(playerID)) return;
+        if (!matchesPlayerStatFlexible(odd, playerID, statCategories)) return;
         const statID = odd.statID;
-        if (!statCategories.includes(statID)) return;
         if (positionMapping.QB.includes(statID)) foundPositions.add('QB');
         if (positionMapping.WR_TE.includes(statID)) foundPositions.add('WR_TE');
         if (positionMapping.RB.includes(statID)) foundPositions.add('RB');
       });
-
       const playerStats: Record<string, any> = {};
       foundPositions.forEach((pos) => {
         playerStats[pos] = {};
@@ -206,6 +248,7 @@ export const calculatePlayerScores = async (req: any, res: any) => {
         weightedScore,
       };
     };
+
     const playersData = playerIDs.map((id: string) => processPlayerStats(id));
     res.send({ success: true, players: playersData });
   } catch (err: any) {
