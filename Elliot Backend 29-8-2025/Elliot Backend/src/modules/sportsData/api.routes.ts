@@ -78,14 +78,31 @@ router.get('/rank-players', async (req: any, res: any) => {
     const { page = 1, limit = 10, position, sortBy, order, preferredBookmaker = 'draftkings' } = req.query;
     const pageNum = Math.max(Number.parseInt(page), 1);
     const pageSize = Math.max(Number.parseInt(limit), 1);
+    const canon = (s: any) =>
+      String(s ?? '')
+        .trim()
+        .replace(/\s+/g, '_');
+
+    const expectedOddID = (statID: string, playerID: string) => `${statID}-${canon(playerID)}-game-yn-yes`;
+    const matchesPlayerStatFlexible = (odd: any, playerID: string, statCategories: string[]) => {
+      if (!odd?.oddID || !odd?.statID) return false;
+      if (!statCategories.includes(odd.statID)) return false;
+      if (odd.statID === 'touchdowns') {
+        return String(odd.oddID).trim() === expectedOddID(odd.statID, playerID);
+      }
+      return String(odd.oddID).includes(playerID);
+    };
+
     const [oddsData] = await OddsStorage.aggregate([
       { $sort: { createdAt: -1 } },
       { $limit: 1 },
       { $project: { data: 1, createdAt: 1 } },
     ]);
+
     if (!oddsData) {
       return res.status(404).json({ success: false, message: 'No odds data found in database' });
     }
+
     const events: any[] = oddsData.data || [];
     const statCategories = [
       'passing_yards',
@@ -96,11 +113,13 @@ router.get('/rank-players', async (req: any, res: any) => {
       'receiving_yards',
       'receiving_longestReception',
     ];
+
     const positionMapping: any = {
       QB: ['passing_yards', 'passing_touchdowns', 'touchdowns'],
       WR_TE: ['receiving_yards', 'receiving_receptions', 'touchdowns', 'receiving_longestReception'],
       RB: ['rushing_yards', 'receiving_receptions', 'receiving_yards', 'touchdowns'],
     };
+
     const normalizeOdds = (val: any): number | null => {
       if (val === undefined || val === null) return null;
       if (typeof val === 'number') return val;
@@ -111,8 +130,10 @@ router.get('/rank-players', async (req: any, res: any) => {
       }
       return null;
     };
+
     const pickBookmaker = (byBookmaker: any, statID: string, preferred: string) => {
       if (!byBookmaker || Object.keys(byBookmaker).length === 0) return null;
+
       if (statID === 'receiving_yards' || statID === 'rushing_yards') {
         const priority = [preferred, 'bovada', 'caesars', 'prophetexchange', 'betonline', 'hardrockbet', 'draftkings'];
         for (const book of priority) {
@@ -140,6 +161,7 @@ router.get('/rank-players', async (req: any, res: any) => {
           }
         }
       }
+
       let latest: any = null;
       Object.entries(byBookmaker).forEach(([bookName, bookData]: any) => {
         const bookTime = new Date(bookData.lastUpdatedAt || 0).getTime();
@@ -154,7 +176,7 @@ router.get('/rank-players', async (req: any, res: any) => {
         }
       });
       if (latest) {
-        delete latest._time;
+        delete (latest as any)._time;
         return latest;
       }
       return null;
@@ -162,27 +184,31 @@ router.get('/rank-players', async (req: any, res: any) => {
 
     const convertOddsToScore = (odds: number | null): number => {
       if (odds === null) return 0;
-      let prob = 0;
-      if (odds < 0) prob = -odds / (-odds + 100);
-      else prob = 100 / (odds + 100);
+      const prob = odds < 0 ? -odds / (-odds + 100) : 100 / (odds + 100);
       return prob * 100;
     };
+
     const uniquePlayerIDs = [
       ...new Set(events.flatMap((event: any) => Object.values(event.players || {}).map((p: any) => p.playerID))),
     ];
+
     const processPlayerStats = async (playerID: string) => {
       const playerEvents = events.filter((event) => {
         if (!event || !event.odds) return false;
-        return Object.values(event.odds).some((odd: any) => odd?.oddID?.includes(playerID));
+        return Object.values(event.odds).some((odd: any) => matchesPlayerStatFlexible(odd, playerID, statCategories));
       });
+
       if (playerEvents.length === 0) return null;
+
       playerEvents.sort((a, b) => {
         const aTime = new Date(a?.status?.startsAt || 0).getTime();
         const bTime = new Date(b?.status?.startsAt || 0).getTime();
         return bTime - aTime;
       });
+
       const latestEvent = playerEvents[0];
       if (!latestEvent) return null;
+
       const propsMap: Record<
         string,
         { odds: number | null; overUnder: number | null; name: string | null; _time: number }
@@ -191,32 +217,32 @@ router.get('/rank-players', async (req: any, res: any) => {
       for (const oddKey of Object.keys(latestEvent.odds || {})) {
         const odd = latestEvent.odds[oddKey];
         if (!odd) continue;
-        if (!odd.oddID || !odd.oddID.includes(playerID)) continue;
+        if (!matchesPlayerStatFlexible(odd, playerID, statCategories)) continue;
+
         const statID = odd.statID;
-        if (!statCategories.includes(statID)) continue;
-        if (propsMap[statID]) {
-          continue;
-        }
+        if (propsMap[statID]) continue;
+
         const chosenBook = pickBookmaker(odd.byBookmaker, statID, preferredBookmaker);
         if (!chosenBook) continue;
-        const normalizedOdds = normalizeOdds(chosenBook.odds);
-        const normalizedOverUnder = normalizeOdds(chosenBook.overUnder);
+
         propsMap[statID] = {
-          odds: normalizedOdds,
-          overUnder: normalizedOverUnder,
+          odds: normalizeOdds(chosenBook.odds),
+          overUnder: normalizeOdds(chosenBook.overUnder),
           name: chosenBook.bookName || null,
           _time: new Date(chosenBook.lastUpdatedAt || latestEvent.status?.startsAt || 0).getTime(),
         };
       }
+
+      // positions (using same matcher)
       const foundPositions: Set<string> = new Set();
       Object.values(latestEvent.odds || {}).forEach((odd: any) => {
-        if (!odd?.oddID?.includes(playerID)) return;
+        if (!matchesPlayerStatFlexible(odd, playerID, statCategories)) return;
         const statID = odd.statID;
-        if (!statCategories.includes(statID)) return;
         if (positionMapping.QB.includes(statID)) foundPositions.add('QB');
         if (positionMapping.WR_TE.includes(statID)) foundPositions.add('WR_TE');
         if (positionMapping.RB.includes(statID)) foundPositions.add('RB');
       });
+
       const playerStats: Record<string, any> = {};
       foundPositions.forEach((pos) => {
         playerStats[pos] = {};
@@ -227,6 +253,7 @@ router.get('/rank-players', async (req: any, res: any) => {
             : { name: null, odds: null, overUnder: null };
         });
       });
+
       const weightedScore =
         (propsMap['passing_yards']?.overUnder ?? 0) * 0.1 +
         (propsMap['passing_touchdowns']?.overUnder ?? 0) * 4 +
@@ -234,6 +261,8 @@ router.get('/rank-players', async (req: any, res: any) => {
         (propsMap['receiving_receptions']?.overUnder ?? 0) * 1 +
         (propsMap['rushing_yards']?.overUnder ?? 0) * 0.1 +
         (propsMap['touchdowns']?.odds ? convertOddsToScore(propsMap['touchdowns'].odds) : 0);
+
+      // player name
       let playerName = '';
       for (const event of playerEvents) {
         const playerData = Object.values(event.players || {}).find((p: any) => p.playerID === playerID);
@@ -242,12 +271,14 @@ router.get('/rank-players', async (req: any, res: any) => {
           break;
         }
       }
+
+      // optional ESPN position lookup
       let espnPosition: string | null = null;
       try {
         if (typeof fetchPlayerPosition === 'function' && playerName) {
           espnPosition = await fetchPlayerPosition(playerName);
         }
-      } catch (e) {
+      } catch {
         espnPosition = null;
       }
 
@@ -260,13 +291,16 @@ router.get('/rank-players', async (req: any, res: any) => {
         weightedScore,
       };
     };
+
     const playerPromises = uniquePlayerIDs.map((id) => processPlayerStats(id));
     let playersData = (await Promise.all(playerPromises)).filter(Boolean) as any[];
+
     if (position) {
       playersData = playersData.filter((p) => p.position === position);
     }
+
     if (sortBy && order) {
-      const orderFactor = order.toLowerCase() === 'desc' ? -1 : 1;
+      const orderFactor = String(order).toLowerCase() === 'desc' ? -1 : 1;
       playersData = playersData.filter((p) =>
         ['QB', 'RB', 'WR_TE'].some((pos) => p.stats[pos] && p.stats[pos][sortBy] !== undefined)
       );
@@ -282,6 +316,7 @@ router.get('/rank-players', async (req: any, res: any) => {
     } else {
       playersData.sort((a, b) => (b.weightedScore ?? 0) - (a.weightedScore ?? 0));
     }
+
     const totalPlayers = playersData.length;
     const paginated = playersData.slice((pageNum - 1) * pageSize, pageNum * pageSize).map((player, index) => ({
       rank: (pageNum - 1) * pageSize + index + 1,
